@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	bleed "github.com/FiloSottile/Heartbleed/bleed"
+	bleed "github.com/LucaFilipozzi/Heartbleed/bleed"
 	"log"
 	"net/url"
 	"os"
