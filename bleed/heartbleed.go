@@ -63,7 +63,7 @@ func Heartbleed(tgt *Target, payload []byte, skipVerify bool) (string, error) {
 		host = host + ":443"
 	}
 
-	net_conn, err := net.DialTimeout("tcp", host, 3*time.Second)
+	net_conn, err := net.DialTimeout("tcp", host, 1*time.Second)
 	if err != nil {
 		return "", err
 	}

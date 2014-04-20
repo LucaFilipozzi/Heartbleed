@@ -1,64 +1,176 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	bleed "github.com/LucaFilipozzi/Heartbleed/bleed"
-	"log"
-	"net/url"
-	"os"
+    "bufio"
+    "encoding/csv"
+    "flag"
+    "fmt"
+    "net"
+    "os"
+    "strings"
+    "sync"
+    "time"
+
+    bleed "github.com/LucaFilipozzi/Heartbleed/bleed"
+    ipaddr "github.com/mikioh/ipaddr"
 )
 
-var usageMessage = `This is a tool for detecting OpenSSL Heartbleed vulnerability (CVE-2014-0160).
+type Command struct {
+    mode string
+    host string
+    port string
+}
 
-Usage:  %s [flags] server_name[:port]
+type Response struct {
+    mode string
+    host string
+    port string
+    result string
+    reason string
+}
 
-The default port is 443 (HTTPS).
-If a URL is supplied in server_name, it will be parsed to extract the host, but not the protocol.
+func ProcessCommand(command Command) (response Response) {
+    response.mode = command.mode
+    response.host = command.host
+    response.port = command.port
 
-The following flags are recognized:
-`
+    var tgt bleed.Target
+    tgt.Service = command.mode
+    tgt.HostIp = command.host + ":" + command.port
 
-func usage() {
-	fmt.Fprintf(os.Stderr, usageMessage, os.Args[0])
-	flag.PrintDefaults()
-	os.Exit(2)
+    _, err := bleed.Heartbleed(&tgt, []byte("heartbleed.filippo.io"), true)
+    if err == bleed.Safe {
+        response.result = "N"
+        response.reason = "SAFE"
+    } else if err != nil {
+        if strings.Contains(err.Error(),"Please try again") {
+            response.result = "U"
+            response.reason = "UNKNOWN - PLEASE TRY AGAIN"
+        } else if strings.Contains(err.Error(),"i/o timeout") {
+            response.result = "U"
+            response.reason = "UNKNOWN - CONNECTION TIMED OUT"
+        } else if strings.Contains(err.Error(),"connection refused") {
+            response.result = "N"
+            response.reason = "NOT VULNERABLE - CONNECTION REFUSED"
+        } else {
+            response.result = "E"
+            response.reason = "ERROR - " + err.Error()
+        }
+    } else {
+        response.result = "Y"
+        response.reason = "VULNERABLE"
+    }
+    return
 }
 
 func main() {
-	var tgt bleed.Target
+    // parse command line arguments
+    verboseFlag := flag.Bool("verbose", false, "enable verbosity on stderr")
+    workersFlag := flag.Int("workers", 512, "number of workers with which to scan targets")
+    flag.Usage = func() {
+        fmt.Fprintf(os.Stderr, "Options:\n")
+        flag.PrintDefaults()
+    }
+    flag.Parse()
 
-	flag.StringVar(&tgt.Service, "service", "https", fmt.Sprintf("Specify a service name to test (using STARTTLS if necessary). \n\t\tBesides HTTPS, currently supported services are: \n\t\t%s", bleed.Services))
-	check_cert := flag.Bool("check-cert", false, "check the server certificate")
-	flag.Parse()
+    // set up a csv writer that outputs to stdout
+    writer := csv.NewWriter(os.Stdout)
 
-	if flag.NArg() < 1 {
-		usage()
-	}
+    // set up the channels for worker communication
+    commandChannel := make(chan Command, 128 * *workersFlag)
+    responseChannel := make(chan Response, 128 * *workersFlag)
 
-	tgt.HostIp = flag.Arg(0)
+    // set up a wait group to track the workers
+    waitgrp := &sync.WaitGroup{}
 
-	u, err := url.Parse(tgt.HostIp)
-	if err == nil && u.Host != "" {
-		tgt.HostIp = u.Host
-		if u.Scheme != "" {
-			tgt.Service = u.Scheme
-		}
-	}
+    // spin up the commandChannel handlers
+    for i := 0; i < *workersFlag; i++ {
+        go func() {
+            for command := range commandChannel {
+                responseChannel <- ProcessCommand(command)
+                waitgrp.Done()
+            }
+        }()
+    }
 
-	out, err := bleed.Heartbleed(&tgt, []byte("heartbleed.filippo.io"), !(*check_cert))
-	if err == bleed.Safe {
-		log.Printf("%v - SAFE", tgt.HostIp)
-		os.Exit(0)
-	} else if err != nil && err.Error() == "Please try again" {
-		log.Printf("%v - TRYAGAIN: %v", tgt.HostIp, err)
-		os.Exit(2)
-	} else if err != nil {
-		log.Printf("%v - ERROR: %v", tgt.HostIp, err)
-		os.Exit(2)
-	} else {
-		log.Printf("%v\n", out)
-		log.Printf("%v - VULNERABLE", tgt.HostIp)
-		os.Exit(1)
-	}
+    // spin up the responseChannel handler
+    go func() {
+        for {
+            select {
+                case response := <-responseChannel:
+                    writer.Write([]string{response.result, response.mode, response.host, response.port, response.reason})
+                    writer.Flush()
+                case <-time.After(5 * time.Second):
+                    fmt.Fprintln(os.Stderr, "timed out")
+                    os.Exit(1)
+            }
+        }
+    }()
+
+    // process each line from standard input and issue command
+    scanner := bufio.NewScanner(os.Stdin)
+    for scanner.Scan() {
+        line := scanner.Text()
+        if strings.Count(line, ",") != 2 {
+            if *verboseFlag {
+                fmt.Fprintln(os.Stderr, "skipping", line, "does not parse correctly")
+            }
+            continue
+        }
+
+        parts := strings.Split(line, ",")
+        mode := parts[0]
+        spec := parts[1]
+        port := parts[2]
+
+        switch mode {
+            case "ftp", "https", "imap", "pop3", "smtp":
+                // do nothing - these are the valid modes
+            default:
+                if *verboseFlag {
+                    fmt.Fprintln(os.Stderr, "skipping", line, "invalid mode")
+                }
+                continue
+        }
+
+        if strings.Contains(spec, "/") {
+            ip, ipnet, err := net.ParseCIDR(spec)
+            if err != nil {
+                if *verboseFlag {
+                    fmt.Fprintln(os.Stderr, "skipping", line, err)
+                }
+                continue
+            }
+
+            nbits, _ := ipnet.Mask.Size()
+            prefix, err := ipaddr.NewPrefix(ipnet.IP, nbits)
+            if err != nil {
+                if *verboseFlag {
+                    fmt.Fprintln(os.Stdout, "skipping", line, err)
+                }
+            }
+
+            for host := range prefix.HostIter(ip) {
+                if *verboseFlag {
+                    fmt.Fprintln(os.Stderr, "scanning", mode, host.String(), port)
+                }
+                waitgrp.Add(1)
+                commandChannel <- Command{mode, host.String(), port}
+            }
+        } else {
+            if *verboseFlag {
+                fmt.Fprintln(os.Stderr, "scanning", mode, spec, port)
+            }
+            waitgrp.Add(1)
+            commandChannel <- Command{mode, spec, port}
+        }
+    }
+
+    // wait for all workers to finish and clean up
+    waitgrp.Wait()
+    close(commandChannel)
+    close(responseChannel)
+    writer.Flush()
 }
+
+// vim: ft=go ts=4 sw=4 et ai sm:
